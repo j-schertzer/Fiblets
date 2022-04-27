@@ -122,6 +122,7 @@ Criterion/None: no color criterion selected, colormaps shading is not relevant
 Criterion/Length: criterion is proportional to the length of fibers
 Criterion/Zone of interest: Pressing ```alt + left click``` defines the center from where the distance to the fiber is evaluated, thus computing a distance criterion. Lowest distance is mapped to 255.
 Criterion/Lateralization: The criterion is computed with the y coordinate of the center of mass of fibers
+
 # Datase
 
 An example file in fft is available in the data folder.
@@ -130,12 +131,11 @@ This file contains 500,000 fibers, 430,000,000 segments and it weighs 5.21GB in 
 
 
 # License
-Source code provided FOR REVIEW ONLY, as part of the submission entitled
-"Fiblets for Real-Time Rendering of Massive Brain Tractograms".
 
-A proper version of this code will be released if the paper is accepted
-with the proper licence, documentation and bug fix.
-Currently, this material has to be considered confidential and shall not
-be used outside the review process.
-
-All right reserved. The Authors
+Source Code for the submission:
+   Fiblets for Real-Time Rendering of Massive Brain Tractograms.
+   J. Schertzer, C. Mercier, S. Rousseau and T. Boubekeur
+   Computer Graphics Forum 2022
+   DOI: 10.1111/cgf.14486
+All rights reserved. Use of this source code is governed by a
+MIT license that can be found in the LICENSE file.
