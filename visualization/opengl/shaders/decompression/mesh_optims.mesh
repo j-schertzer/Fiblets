@@ -1,13 +1,12 @@
 // --------------------------------------------------------------------------
-// Source code provided FOR REVIEW ONLY, as part of the submission entitled
-// "Fiblets for Real-Time Rendering of Massive Brain Tractograms".
+// This file is part of the reference implementation for the paper
+//    Fiblets for Real-Time Rendering of Massive Brain Tractograms.
+//    J. Schertzer, C. Mercier, S. Rousseau and T. Boubekeur
+//    Computer Graphics Forum 2022
+//    DOI: 10.1111/cgf.14486
 //
-// A proper version of this code will be released if the paper is accepted
-// with the proper licence, documentation and bug fix.
-// Currently, this material has to be considered confidential and shall not
-// be used outside the review process.
-//
-// All right reserved. The Authors
+// All rights reserved. Use of this source code is governed by a
+// MIT license that can be found in the LICENSE file.
 // --------------------------------------------------------------------------
 
 #extension GL_NV_mesh_shader : require
