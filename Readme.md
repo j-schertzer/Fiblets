@@ -1,5 +1,28 @@
 # Fiblets for Real-Time Rendering of Massive Brain Tractograms
 
+# Overview
+This software is made to visualize dMRI brain tractograms in real-time. These tractograms should have been generated using a method that ensures a constant stepsize along each individual fiber. This property can be checked using our software. We currently can compress .tck files, and load .fft files that the software can save. This is the C++ reference implementation for the paper: 
+
+>**Fiblets for real-time rendering of massive brain tractograms** <br/>
+*Jérémie Schertzer, Corentin Mercier, Sylvain Rousseau and Tamy Boubekeur.*<br/>
+Computer Graphics Forum 2022<br/>
+DOI: 10.1111/cgf.14486<br/>
+
+This is not the exact same version of the source code that is used to measure performance for the corresponding paper. Performance might have been slightly affected during refactoring.
+
+Copyright(C) 2022 Jérémie Schertzer, Corentin Mercier, Sylvain Rousseau and Tamy Boubekeur
+
+All right reserved
+
+# Datase
+
+An example file in the tck (uncompressed) format is available in the data folder.
+This file contains 1,000 fibers.
+
+You will find other data in the fft format (compressed) here:
+https://drive.google.com/drive/folders/1rpQ4zmuS8VssRWd-DZ6N8MaaRaXUnHDd?usp=sharing
+
+
 # Installation instructions
 
 This code was tested under Linux using Ubuntu 18.04, 19.04, and 20.04, as well as on Windows 10.
@@ -122,16 +145,6 @@ Criterion/None: no color criterion selected, colormaps shading is not relevant
 Criterion/Length: criterion is proportional to the length of fibers
 Criterion/Zone of interest: Pressing ```alt + left click``` defines the center from where the distance to the fiber is evaluated, thus computing a distance criterion. Lowest distance is mapped to 255.
 Criterion/Lateralization: The criterion is computed with the y coordinate of the center of mass of fibers
-
-# Datase
-
-An example file in the tck (uncompressed) format is available in the data folder.
-This file contains 1,000 fibers.
-
-You will find other data in the fft format (compressed) here:
-https://drive.google.com/drive/folders/1rpQ4zmuS8VssRWd-DZ6N8MaaRaXUnHDd?usp=sharing
-
-
 
 # License
 
