@@ -1,6 +1,5 @@
 *.user
 /build
-/data
 */build/*
 *bin/*
 *.vs

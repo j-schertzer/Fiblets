@@ -125,8 +125,11 @@ Criterion/Lateralization: The criterion is computed with the y coordinate of the
 
 # Datase
 
-An example file in fft is available in the data folder.
-This file contains 500,000 fibers, 430,000,000 segments and it weighs 5.21GB in the tck format.
+An example file in the tck (uncompressed) format is available in the data folder.
+This file contains 1,000 fibers.
+
+You will find other data in the fft format (compressed) here:
+https://drive.google.com/drive/folders/1rpQ4zmuS8VssRWd-DZ6N8MaaRaXUnHDd?usp=sharing
 
 
 
