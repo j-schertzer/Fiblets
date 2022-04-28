@@ -10,6 +10,8 @@ This software is made to visualize dMRI brain tractograms in real-time. These tr
 Computer Graphics Forum 2022<br/>
 DOI: 10.1111/cgf.14486<br/>
 
+You can find the paper and the video presentation here: https://perso.telecom-paristech.fr/boubek/papers/Fiblets/
+
 This is not the exact same version of the source code that is used to measure performance for the corresponding paper. Performance might have been slightly affected during refactoring.
 
 Copyright(C) 2022 Jérémie Schertzer, Corentin Mercier, Sylvain Rousseau and Tamy Boubekeur
