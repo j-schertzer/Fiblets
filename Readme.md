@@ -34,9 +34,9 @@ By default, compress the tck input file, except with '-p' and '-c' options
 
 ## Windows
 A stand alone version of the code, compiled for x64 and tested on windows 10 can be directly executed in the subfolder 
-.../standalone/bin/FiberVisualizer.exe
+.../StandaloneBinary/FiberVisualizer.exe
 
-Tested with Visual Studio 2015 on windows10.
+Tested with Visual Studio 2015 and 2019 on windows10.
 
 With CmakeGui, fill the path of the root CMakeLists.txt (PATHPROJECT) of the project<br>
 Fill the build path with : PATHPROJECT/build <br>
