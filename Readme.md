@@ -1,5 +1,7 @@
 # Fiblets for Real-Time Rendering of Massive Brain Tractograms
 
+![illustration](fiblet-logo.gif)
+
 # Overview
 This software is made to visualize dMRI brain tractograms in real-time. These tractograms should have been generated using a method that ensures a constant stepsize along each individual fiber. This property can be checked using our software. We currently can compress .tck files, and load .fft files that the software can save. This is the C++ reference implementation for the paper: 
 
