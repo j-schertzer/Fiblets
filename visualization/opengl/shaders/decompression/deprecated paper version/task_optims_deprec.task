@@ -8,16 +8,10 @@
 // All rights reserved. Use of this source code is governed by a
 // MIT license that can be found in the LICENSE file.
 // --------------------------------------------------------------------------
-/* improvement of task culling using subgroups functions
-more info at : 
-- https://github.com/KhronosGroup/GLSL/blob/master/extensions/khr/GL_KHR_shader_subgroup.txt
-- https://slideplayer.com/slide/15695814/
-*/
 
 #extension GL_NV_mesh_shader : require //Mesh shader extension
 #extension GL_NV_gpu_shader5 : enable //uint8_t
 #extension GL_KHR_shader_subgroup_ballot : enable //ballot functions
-#extension GL_NV_shader_thread_shuffle : require //shuffleDown
 
 #if ((NB_PTS_PER_BLOCK + 16) % 4 == 0)
 	#define PACK_SIZE (NB_PTS_PER_BLOCK + 16)
@@ -92,29 +86,34 @@ const uint minCritCull = (dataz2)>>24;
 const uint maxCritCull = ((dataz2)>>16)&0xff;
 
 
-bool synthesizeFibletTests(const in vec3 pt, const uint fid);
+float rejectFiber(const in vec3 pt, const uint fid);
 void main(void)
 {
-	const uint ID = gl_WorkGroupID.x*GROUP_SIZE + gl_LocalInvocationID.x;//fiblet ID
-	const uint crit = getCriterionfromFiberID(listOfPoints[ID].data[3]);
-	const bool fiberEnd = ((listOfPoints[ID].data[4] >> 24)&0x40)==0;
-	bool synthesizeFiblet = false;
-	if (crit>=minCritCull && crit<=maxCritCull)// custom criterion culling
-	{
-		vec3 decompressedValue;
-		{
-		const vec2 a = unpackUnorm2x16(listOfPoints[ID].data[0]);
-		const vec2 b = unpackUnorm2x16(listOfPoints[ID].data[1]);
-			decompressedValue = vec3(a.x, a.y, b.x);
-		}
-		synthesizeFiblet = synthesizeFibletTests(decompressedValue, ID);
-	}
-	const bool synthesizeFibletNext = shuffleDownNV(synthesizeFiblet,1,32);// retrieving fiblet test of next fiblet
+	uint ID = gl_WorkGroupID.x*GROUP_SIZE + gl_LocalInvocationID.x;
 
-	bool render = synthesizeFiblet && (synthesizeFibletNext||fiberEnd);//
+	//Decompression
+	vec2 a = unpackUnorm2x16(listOfPoints[ID].data[0]);
+	vec2 b = unpackUnorm2x16(listOfPoints[ID].data[1]);
+	bool fiberEnd = ((listOfPoints[ID].data[4] >> 24)&0x40)==0;
+	vec3 decompressedValue = vec3(a.x, a.y, b.x);
+	float criterion = rejectFiber(decompressedValue, ID);
+
+// next point
+	a = unpackUnorm2x16(listOfPoints[ID+1].data[0]);
+	b = unpackUnorm2x16(listOfPoints[ID+1].data[1]);
+	decompressedValue = vec3(a.x, a.y, b.x);
+	bool renderCurrent = criterion>0.0;
+	bool renderNext = (rejectFiber(decompressedValue, ID)>0.0);	
+
+	uint crit = getCriterionfromFiberID(listOfPoints[ID].data[3]) ;
+	bool critRender = ( crit >= minCritCull ) && ( crit <= maxCritCull ); 
+
+	bool render = renderCurrent && (fiberEnd || renderNext ) && critRender;
+
+//	bool render = renderCurrent;
+#if GROUP_SIZE > 1
 	uvec4 vote  = subgroupBallot(render);
 	uint  tasks = subgroupBallotBitCount(vote);
-
 	if (gl_LocalInvocationID.x == 0)
 	{
 		// write the number of surviving meshlets, i.e.
@@ -127,8 +126,20 @@ void main(void)
 	  uint idxOffset = subgroupBallotExclusiveBitCount(vote);
 	if (render)
 	{
+		#if (AGGRESSIVE_OPTIM == 1)
+		OUT.subIDs[idxOffset] = uint8_t(gl_LocalInvocationID.x) + uint8_t(0x80 * uint(criterion<RENDER_SINGLE_SEGMENT_RATIO));
+		//disabling compression in that case
+		#else
 		OUT.subIDs[idxOffset] = uint8_t(gl_LocalInvocationID.x);
+		#endif
 	}
+#else
+	gl_TaskCountNV = uint(render);
+	OUT.baseID = gl_WorkGroupID.x * GROUP_SIZE ;
+
+#endif
+
+
 }
 
 
@@ -164,23 +175,23 @@ uint getCriterionfromFiberID(uint fid)
     return (criterion[gid]>>lid)%256;
 }
 
-bool synthesizeFibletTests(const in vec3 pt, const uint fid)
+float rejectFiber(const in vec3 pt, const uint fid)
 {
 	vec4 ptest = projCamMultMV * vec4(pt,1.0);
 	if (testInGuardFrustrum(ptest)==false)
-		return false;
+		return -1.0;
 	if (testRenderZmask(ptest)==false)
-		return false;
+		return -1.0;
 
-	
+	float tessL = clamp(data2.y/max(0.00001,ptest.w-data1.x),0.0,1.0);
 
 	#if (AGGRESSIVE_OPTIM == 1)
-	float tessL = clamp(data2.y/max(0.00001,ptest.w-data1.x),0.0,1.0);
+	//we delete 900/1000 of fibers if tessL = 0.0 (asymptotic case)
 	uint threshold = uint(mix(900.0,0.0,2.0*tessL/RENDER_SINGLE_SEGMENT_RATIO));
 
 	if ((fid%1000) < threshold)
-		return false;
+		return -1.0;
 	#endif
 
-	return true;
+	return tessL;
 }

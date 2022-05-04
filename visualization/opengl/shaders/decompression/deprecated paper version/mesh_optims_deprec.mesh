@@ -1,0 +1,588 @@
+// --------------------------------------------------------------------------
+// This file is part of the reference implementation for the paper
+//    Fiblets for Real-Time Rendering of Massive Brain Tractograms.
+//    J. Schertzer, C. Mercier, S. Rousseau and T. Boubekeur
+//    Computer Graphics Forum 2022
+//    DOI: 10.1111/cgf.14486
+//
+// All rights reserved. Use of this source code is governed by a
+// MIT license that can be found in the LICENSE file.
+// --------------------------------------------------------------------------
+
+#extension GL_NV_mesh_shader : require
+#extension GL_NV_gpu_shader5 : enable
+//#pragma optionNV (unroll all)
+//NB_PTS_PER_BLOCK must be dividible by 2 and <=62
+#if ((NB_PTS_PER_BLOCK + 16) % 4 == 0)
+	#define PACK_SIZE (NB_PTS_PER_BLOCK + 16)
+#else
+	#define PACK_SIZE ((NB_PTS_PER_BLOCK + 16) + (4 - (NB_PTS_PER_BLOCK + 16) % 4))
+#endif
+
+//for testing iterative method vs parallel method
+//#define USE_SINGLE_THREAD 
+
+
+#define LAST_THREAD (NB_PTS_PER_BLOCK/2) //will be 30 if NB_PTS_PER_BLOCK=60
+const uint MAXTHREAD[6] = {30,30,28,28,28,28};//valid only for 60 points
+//since matrix reduction is unrolled and 60  is not a power of two
+// each step needs to stop at a limit thread in order to avoid multiplying matrix 60 and 61 by the rest
+// we don't want that multiplication because those are the next block coordinates, not defined relatively then !
+
+#define NEM (6) //number of uint elements stored per 4x4 tranformation matrix
+//6 uint per matrix are enough because such transformation matrix are a 3x3 rotation matrix + a vec3 translation
+//last column of the 3x3 rotation matrix is simply cross(c[0],c[1])
+// and those 6 floats can be packed in 3 uint with packSnorm2x16/unpackSnorm2x16.
+// precision is not lost because those rotation are quantified at way higher level by our compression scheme
+// the 3 dimension of the translation are converted to uint with floatBitsToUint/uintBitsToFloat so 32 bits precision is kept
+// 3+3 = 6
+
+const uint matMemBankSize = NEM*32;
+
+//for NEM = 6
+const uint offsetMem[NEM*2] = {32 * 0,32 * 1,32 * 2,32 * 3,32 * 4,32 * 5
+						,matMemBankSize+32 * 0,matMemBankSize+32 * 1,matMemBankSize+32 * 2,matMemBankSize+32 * 3
+						,matMemBankSize+32 * 4,matMemBankSize+32 * 5};
+
+#ifndef USE_SINGLE_THREAD
+	#define GROUP_SIZE 32
+#else
+	#define GROUP_SIZE 1	
+#endif
+
+layout(local_size_x=GROUP_SIZE) in;
+layout(max_vertices=64, max_primitives=NB_PTS_PER_BLOCK) out;
+layout(lines) out;
+
+
+taskNV in Task {
+  uint      baseID;
+  uint8_t   subIDs[32];
+} IN;
+
+out PerVertexData
+{
+	uint fid;
+	uint packedTan;
+} v_out[];
+
+layout (binding = 6) uniform sampler2D zPassDepthTex;//r = depth
+
+#define ratio (data1.z)
+#define stepsize (data3.w)
+layout(binding = 1, shared) uniform UBO_STATIC
+{
+	vec4 data0;//xy=m_sizeZtestViewPort.xy, zw=2.0/(m_sizeFBO.xy-1.0)
+	vec4 data1;//x = guardBand, y = angularCorrection, z = ratio, w = scaling
+	vec4 data2;//x = unused, y = tesselationGain, z = colormode & backgroundflag, w = m_sizeSubsampledZBuffers.x
+	vec4 data3;//xyz = frustrum test constants, w = stepsize
+	vec4 sliders;//x = percent of fiber drawn, y = selected fiber Radius size, z = alpha selected fiber, w = size of selection
+};
+
+layout(binding = 2, shared) uniform UBO_DYNAMIC
+{
+	mat4 projCam;
+	mat4 ZFilterinvCamProjMultTexShift;
+	mat4 ProjMultCurrentPoseMultInvPreviousProjPoseMultTexShift;
+	mat4 projCamMultMV;
+	mat4 ModelViewCam;
+	mat4 ModelViewOccluder;
+
+	mat4 projSpec;
+	mat4 invProjSpec;
+	mat4 ModelViewSpec;
+	mat4 projSpecMultMV;
+
+	mat4 lights;//4xvec4(xLight,yLigth,zLight,1.0) in specCamSpace
+};
+
+	#if (SPECTATOR_MODE==0)
+		#define PROJ_MAT (projCamMultMV)
+	#else
+		#define PROJ_MAT (projSpecMultMV)
+	#endif
+
+struct pack
+{
+	uint data[PACK_SIZE / 4];
+};
+
+layout(std430, binding = 2)readonly buffer blockSSBO
+{
+	pack listOfPoints[];
+	//data[0] = first.x, first.y
+	//data[1] = first.z, second.x
+	//data[2] = second.y, second.z
+	//data[3] = FiberID
+	//data[4] = state(2bits), number of compressed points(6bits) -  block ID (1 byte) - 2 first points (2 bytes)
+	//data[5 - 19] = 60 compressedPoints
+};
+
+/////////////////
+#if (AGGRESSIVE_OPTIM == 1)
+const uint ID = IN.baseID + (uint(IN.subIDs[gl_WorkGroupID.x])&0x7f);
+#else
+const uint ID = IN.baseID + IN.subIDs[gl_WorkGroupID.x];
+#endif
+const uint fiD = listOfPoints[ID].data[3];
+
+
+#ifndef USE_SINGLE_THREAD
+shared uint transforms[NEM * 32*2];
+#endif
+
+/////////////////
+float mapToSnorm(uint val)
+{
+	return float(val)/127.0-1.0;
+}
+
+vec3 unquantize(in uint point)
+{
+	const float qsize = 16.0;
+
+	float q2 = float(point & 0x0f) / (qsize-1.0f)*2.0f-1.0f;
+	float q1 = float(point>>4) / (qsize-1.0f)*2.0f-1.0f;
+
+	vec3 dir;
+	dir.y = (q1 + q2)*0.5f;
+	dir.z = (q1 - q2)*0.5f;
+	dir.x = 1.0f - abs(dir.y) - abs(dir.z);
+
+	return normalize(dir);
+}
+
+vec3 uniformMappingAxisX(in vec3 v)
+{
+	//v has been normalized previously
+	vec3 ret;
+	ret.x = mix(1.0,v.x,ratio);
+	ret.yz = v.yz * sqrt((1.00000001-ret.x*ret.x)/(1.00000001-v.x*v.x));
+	return ret;
+}
+//2 FMA, 1 DIV, 1 MIX, 1 SQRT, 2 MULT
+
+
+#ifndef USE_SINGLE_THREAD
+	mat2x3 getAxisFromSSBO(in uint TID)
+	{
+		//gets the uncompressed axis of point 2xTID and 2xTID+1
+		mat2x3 axis;
+
+		uint id = TID * 2 +17;
+		uint block = id>>2;
+		uint current32bitsVal = listOfPoints[ID].data[block];
+		uint decalage = ((id&0x03)^0x03)<<3;
+		const uint point1 = (current32bitsVal >> decalage) & 0xff;
+		id = TID * 2 +18;
+		block = id>>2;
+		current32bitsVal = listOfPoints[ID].data[block];
+		decalage = ((id&0x03)^0x03)<<3;//0 or 16
+		const uint point2 = (current32bitsVal >> decalage) & 0xff;
+		axis[0] = uniformMappingAxisX(unquantize(point1));
+		axis[1] = uniformMappingAxisX(unquantize(point2));
+		return axis;
+	}
+
+void storeMultMatTransformStep0(in mat2x3 axis,in vec3 t,in uint TID)//each mat actually encode a full transformation
+{
+	//the first step of the reduction is done manually, this saves a wave of write and read to the shared memory !
+	//we know that the shape of second matrix is the 4x4 matrix is :
+	//[3x3ROT translation(stepsize,0.0,0.0)]
+	//[0.0,0.0,0.0,       1.0              ]
+	//since the last row of such a 3x3 rotation matrix is built from the uncompressed data
+	//the first matrix may have a translation different from translation(stepsize,0.0,0.0), whichi is t
+	//so we can already write the explicite product and store it in the shared variable
+	//TID is the thread id, not the matrix id, since 2 matrix are written
+
+	mat3 r0;
+	r0[0] = axis[0];
+	r0[1] = normalize(cross(r0[0],C));
+	r0[2] = cross(r0[0],r0[1]);
+	//write left matrix to shared that is the combination of r0[0],r0[1]and t
+	transforms[TID + offsetMem[0]] = packSnorm2x16(r0[0].xy);
+	transforms[TID + offsetMem[1]] = packSnorm2x16(vec2(r0[0].z,r0[1].x));
+	transforms[TID + offsetMem[2]] = packSnorm2x16(r0[1].yz);
+	transforms[TID + offsetMem[3]] =  floatBitsToUint(t.x);
+	transforms[TID + offsetMem[4]] =  floatBitsToUint(t.y);
+	transforms[TID + offsetMem[5]] =  floatBitsToUint(t.z);
+
+	//now we multiply
+	mat2x3 r1;
+	r1[0] = axis[1];
+	r1[1] = normalize(cross(r1[0],C));
+	r1 = r0*r1;
+
+	transforms[TID + offsetMem[6]] = packSnorm2x16(r1[0].xy);
+	transforms[TID + offsetMem[7]] = packSnorm2x16(vec2(r1[0].z,r1[1].x));
+	transforms[TID + offsetMem[8]] = packSnorm2x16(r1[1].yz);
+	transforms[TID + offsetMem[9]] =  floatBitsToUint(stepsize*axis[0].x + t.x);
+	transforms[TID + offsetMem[10]] =  floatBitsToUint(stepsize*axis[0].y + t.y);
+	transforms[TID + offsetMem[11]] =  floatBitsToUint(stepsize*axis[0].z + t.z);
+}
+
+
+void storeMultMatReductionStep1234(in uint id0,in uint id1)
+{
+	//mat(id1) = mat(id0)*mat(id1), with an user defined product which is a simplification of the associated mat4 product
+	//read from shared data the mat3 at id0 and id1, and stores the "product" at id1
+	const uint shift0 = ((id0)/2) + ((id0)%2) * matMemBankSize;
+	const uint shift1 = ((id1)/2) + ((id1)%2) * matMemBankSize;
+	mat3 ri0;
+	vec3 ti0;
+	ri0[0].xy = unpackSnorm2x16(transforms[shift0 + offsetMem[0]]);
+	ti0.xy = unpackSnorm2x16(transforms[shift0 + offsetMem[1]]);//temp
+	ri0[0].z = ti0.x;
+	ri0[1].x = ti0.y;
+	ri0[1].yz = unpackSnorm2x16(transforms[shift0 + offsetMem[2]]);
+	ti0.x    = uintBitsToFloat(transforms[shift0 + offsetMem[3]]);
+	ti0.y    = uintBitsToFloat(transforms[shift0 + offsetMem[4]]);
+	ti0.z    = uintBitsToFloat(transforms[shift0 + offsetMem[5]]);
+
+	mat3 ri1;
+	ri1[0].xy = unpackSnorm2x16(transforms[shift1 + offsetMem[0]]);
+	ri1[2].xy = unpackSnorm2x16(transforms[shift1 + offsetMem[1]]);//temp
+	ri1[0].z = ri1[2].x;
+	ri1[1].x = ri1[2].y;
+	ri1[1].yz = unpackSnorm2x16(transforms[shift1 + offsetMem[2]]);
+
+	ri1[2].x = uintBitsToFloat(transforms[shift1 + offsetMem[3]]);//this is translation
+	ri1[2].y = uintBitsToFloat(transforms[shift1 + offsetMem[4]]);
+	ri1[2].z = uintBitsToFloat(transforms[shift1 + offsetMem[5]]);
+
+	ri0[2] = cross(ri0[0],ri0[1]);//finishing the last vector;
+	ri1 = ri0*ri1;
+	//writing back the transform
+	transforms[shift1 + offsetMem[0]] = packSnorm2x16(ri1[0].xy);
+	transforms[shift1 + offsetMem[1]] = packSnorm2x16(vec2(ri1[0].z,ri1[1].x));
+	transforms[shift1 + offsetMem[2]] = packSnorm2x16(ri1[1].yz);
+	transforms[shift1 + offsetMem[3]] = floatBitsToUint(ti0.x + ri1[2].x);
+	transforms[shift1 + offsetMem[4]] = floatBitsToUint(ti0.y + ri1[2].y);
+	transforms[shift1 + offsetMem[5]] = floatBitsToUint(ti0.z + ri1[2].z);
+}
+
+mat2x3 storeMultMatReductionStep5(in uint datamat31[6],in uint id1)// returns the tangeant and the position
+{
+	mat2x3 ret;
+	const uint shift1 = ((id1)/2) + ((id1)%2) * matMemBankSize;
+	mat3 ri0;
+	vec3 ti0;
+	ri0[0].xy = unpackSnorm2x16(datamat31[0]);
+	ti0.xy =    unpackSnorm2x16(datamat31[1]);//temp
+	ri0[0].z = ti0.x;
+	ri0[1].x = ti0.y;
+	ri0[1].yz = unpackSnorm2x16(datamat31[2]);
+	ti0.x    =  uintBitsToFloat(datamat31[3]);
+	ti0.y    =  uintBitsToFloat(datamat31[4]);
+	ti0.z    =  uintBitsToFloat(datamat31[5]);
+	ri0[2] = cross(ri0[0],ri0[1]);//finishing the last vector;
+
+	vec4 tanv;
+	tanv.xy = unpackSnorm2x16(transforms[shift1 + offsetMem[0]]);
+	tanv.zw = unpackSnorm2x16(transforms[shift1 + offsetMem[1]]);
+	ret[0] = ri0*tanv.xyz;
+
+	ret[1].x = uintBitsToFloat(transforms[shift1 + offsetMem[3]]);//this is translation
+	ret[1].y = uintBitsToFloat(transforms[shift1 + offsetMem[4]]);
+	ret[1].z = uintBitsToFloat(transforms[shift1 + offsetMem[5]]);
+	ret[1] = ri0*ret[1] + ti0;
+	return ret;
+}
+
+mat2x3 getTanPoint(const uint matrixID)
+{
+	mat2x3 ret;
+	const uint shift = ((matrixID)/2) + ((matrixID)%2) * matMemBankSize;// (matrixID%32) + (matrixID/32) * 32 * 12;
+	ret[0].xy = unpackSnorm2x16(transforms[shift + offsetMem[0]]);
+	const vec2 v = unpackSnorm2x16(transforms[shift + offsetMem[1]]);
+	ret[0].z = v.x;
+	ret[1].x = uintBitsToFloat(transforms[shift + offsetMem[3]]);
+	ret[1].y = uintBitsToFloat(transforms[shift + offsetMem[4]]);
+	ret[1].z = uintBitsToFloat(transforms[shift + offsetMem[5]]);
+	return ret;
+}
+
+#else
+	vec3 getAxisFromSSBO(in uint TID)
+	{
+		//gets the uncompressed axis of point TID
+		uint id = TID  +17;
+		uint block = id>>2;
+		uint current32bitsVal = listOfPoints[ID].data[block];
+		uint decalage = ((id&0x03)^0x03)<<3;
+		const uint point1 = (current32bitsVal >> decalage) & 0xff;
+		return uniformMappingAxisX(unquantize(point1));
+	}
+	mat4 getMatFromAxis(in vec3 axis)
+	{
+	mat4 ret = mat4(1.0);
+	ret[0].xyz = axis;
+	ret[1].xyz = normalize(cross(ret[0].xyz,C));
+	ret[2].xyz = cross(ret[0].xyz,ret[1].xyz);
+	ret[3].x = stepsize;
+	return ret;
+	}
+#endif
+
+
+void main(void)
+{
+	const uint localID = gl_LocalInvocationID.x;//current thread ID from 0 to 31
+	//thread 0 processes point 0 which is associated to a matrix obtained in a different way compared to other points
+	//thread 0 writes metadata
+	//thread i calculates point 2i, 2i+1
+	//threads 30 is similar to thread 0 if each block is 60 points
+
+	uint nbPtPack = (listOfPoints[ID].data[4] >> 24);// & 0x3f;
+	uint notEnd = uint((nbPtPack & 0x40)!=0);
+	uint notBegin =  uint((nbPtPack & 0x80)!=0);
+	uint mask = 0x40*notEnd + 0x80*notBegin;
+	nbPtPack = (nbPtPack & 0x3f) + notEnd;//nb segments
+	gl_PrimitiveCountNV = min(nbPtPack, nbPtPack - 1);// nbPtPack - 1;
+//gl_PrimitiveCountNV = 1;
+
+#ifndef USE_SINGLE_THREAD
+	#if (AGGRESSIVE_OPTIM == 1)
+		if ((notEnd==1) && ((uint(IN.subIDs[gl_WorkGroupID.x])&0x80) != 0))//draw only one sgement for the compressed fiber
+		//if (notEnd==1)
+		{
+			gl_PrimitiveCountNV = 1;
+
+			if (localID == 0 || localID == 1)
+			{
+				uint currentID = ID + localID;
+				//Uncompress 2 first points
+				vec3 decompressedValues[2];
+				vec2 a = unpackUnorm2x16(listOfPoints[currentID].data[0]);
+				vec2 b = unpackUnorm2x16(listOfPoints[currentID].data[1]);
+				vec2 c = unpackUnorm2x16(listOfPoints[currentID].data[2]);
+				decompressedValues[0] = vec3(a.x, a.y, b.x);
+				decompressedValues[1] = vec3(b.y, c.x, c.y);
+				vec3 t = normalize(decompressedValues[1] - decompressedValues[0]);
+
+				gl_PrimitiveIndicesNV[localID] = localID;
+				v_out[localID].fid = fiD;
+				v_out[localID].packedTan = packSnorm4x8(vec4(t,mapToSnorm(mask + localID)));
+				gl_MeshVerticesNV[localID].gl_Position = PROJ_MAT *vec4(decompressedValues[0], 1.0);
+			}
+			barrier();
+			return ;
+		}
+	#endif
+
+	//#else // no aggressive optim
+	vec3 translate0 = vec3(stepsize,0.0,0.0);
+	mat2x3 axis = mat2x3(0.0);
+	if (localID < LAST_THREAD)
+	{
+		axis = getAxisFromSSBO(localID);
+	}
+	if (localID == (nbPtPack>>1))//for last tangent
+	{
+		axis[nbPtPack&0x01] = vec3(1.0,0.0,0.0);
+	}
+
+	if (localID == 0 || localID == LAST_THREAD)
+	{
+		//Uncompress 2 first points
+		vec3 decompressedValues[2];
+		uint beginID = uint(localID!=0);
+		uint currentID = ID + beginID;
+		vec2 a = unpackUnorm2x16(listOfPoints[currentID].data[0]);
+		vec2 b = unpackUnorm2x16(listOfPoints[currentID].data[1]);
+		vec2 c = unpackUnorm2x16(listOfPoints[currentID].data[2]);
+		decompressedValues[0] = vec3(a.x, a.y, b.x);
+		decompressedValues[1] = vec3(b.y, c.x, c.y);
+		translate0 = decompressedValues[0];
+		axis[0] = normalize(decompressedValues[1] - decompressedValues[0]);
+	}
+	//here comes the reduction of the matrix stack, equivalent to the concatenation, therefore building the fiber
+	// each thread is responsible for 2 points (2 matrix) and each step involve NB_PTS_PER_BLOCK/2 matrix multiplication
+	// for NB_PTS_PER_BLOCK=60  30 matrixmult are necessary per step which is close to the complete warp occupancy (32 threads)
+	// because matrix are sparsely stored in shared memory, and their shape is known and defined (transformation matrix made of 3x3 rotation + translation)
+	// we develop an explicit matrix product in order to avoid useless calculation (see storeMultMatTransformStep0 function)
+	// the general law for the matrix stask reduction is given for a step S with S<=ceil(log2(NB_PTS_PER_BLOCK))
+	//and a threadID TID with 0<= TID < floor(NB_PTS_PER_BLOCK/2) is the following one
+	//	uint leftID = ((TID >> S) << (S + 1)) + (1 << S) - 1;
+	//	uint rightID = (((TID >> S) + 1) << S) + TID;
+	//	storeMultMatReductionStep123(leftID,rightID);
+	//if we want to clamp the stack reduction to NB_PTS_PER_BLOCK-1 so that following matrix are not multiplied (because part of the next block)
+	// each step has to run on a limited number of thread defined in the list MAXTHREAD[number of steps]
+	// that list is built solving the equation for each step S : MAXTHREAD[S] = argmax(TID, leftID(TID,S)<=NB_PTS_PER_BLOCK-1 )+1
+	//Shared memory is used to store the matrix stack at each step and proper barriers are issued between each step
+	//One can notice that step 0 takes matrix 2xTID and 2xTID+1 and multiply them !
+	//better than writing to the shared memory the initial state of all the matrix stack (that are retrieved through decompression)
+	// and then reading back from it for the step0, We process step 0 speratately by localy retrieving the 2 matrix and simply writing to the
+	// shared memory the result of the multiplication (see storeMultMatTransformStep0). By doing this we save a read/write wave to the shared memory
+	// note that the extra theard at step 0 that is processing next block first two points
+	// this is the reason we clamp the reduction specificaly to NB_PTS_PER_BLOCK-1
+	// simply matrix 31 needs to be written to the shared memory => custom function
+	// step5 doesnt need to write at all to the shared memory => custom function
+
+	//NOTE : it is faster to skip thread tests for each step and there are no consequences since the last matrix is overwritten
+	//doing reduction step0
+	//if (localID < MAXTHREAD[0])
+	{
+		storeMultMatTransformStep0(axis,translate0,localID);
+	}
+	memoryBarrierShared();
+	barrier();
+
+	uint localShift=localID;
+
+	//reduction step1
+	//if (localID < MAXTHREAD[1])
+	{
+		localShift = localShift >> 1;
+		const uint left = (localShift<<2) + 1;
+		const uint right = ((localShift+1)<<1) + localID;
+		storeMultMatReductionStep1234(left,right);
+	}
+	memoryBarrierShared();
+	barrier();
+
+	//reduction step2
+	//if (localID < MAXTHREAD[2])
+	{
+		localShift = localShift >> 1;
+		const uint left = (localShift<<3) + 3;
+		const uint right = ((localShift+1)<<2) + localID;
+		storeMultMatReductionStep1234(left,right);
+	}
+	memoryBarrierShared();
+	barrier();
+
+	//reduction step3
+	//if (localID < MAXTHREAD[3])
+	{
+		localShift = localShift >> 1;
+		const uint left = (localShift<<4) + 7;
+		const uint right = ((localShift+1)<<3) + localID;
+		storeMultMatReductionStep1234(left,right);
+	}
+	memoryBarrierShared();
+	barrier();
+
+	//reduction step4
+	//if (localID < MAXTHREAD[4])
+	{
+		localShift = localShift >> 1;
+		const uint left = (localShift<<5) + 15;
+		const uint right = ((localShift+1)<<4) + localID;
+		storeMultMatReductionStep1234(left,right);
+	}
+	memoryBarrierShared();
+	barrier();
+
+	//reduction step5
+	//we can use broadcoast access !
+	uint datamat31[6];
+	//const uint left = 31;
+	//const uint shiftleft = ((left)/2) + ((left)%2) * matMemBankSize;
+	datamat31[0] = transforms[matMemBankSize + 15 + offsetMem[0]];
+	datamat31[1] = transforms[matMemBankSize + 15 + offsetMem[1]];
+	datamat31[2] = transforms[matMemBankSize + 15 + offsetMem[2]];
+	datamat31[3] = transforms[matMemBankSize + 15 + offsetMem[3]];
+	datamat31[4] = transforms[matMemBankSize + 15 + offsetMem[4]];
+	datamat31[5] = transforms[matMemBankSize + 15 + offsetMem[5]];
+	//if (localID < MAXTHREAD[5]) // writing mesh shader output for points 32 to NB_PTS_PER_BLOCK-1
+	{
+		const uint right = 32 + localID;
+		const mat2x3 m = storeMultMatReductionStep5(datamat31,right);
+		const uint doubleRight = right<<1;
+		gl_PrimitiveIndicesNV[doubleRight] = right;
+		gl_PrimitiveIndicesNV[doubleRight + 1] = right + 1;
+
+		v_out[right].fid = fiD;
+		v_out[right].packedTan = packSnorm4x8(vec4(m[0],mapToSnorm(mask + right)));
+		gl_MeshVerticesNV[right].gl_Position = PROJ_MAT *vec4(m[1], 1.0);
+	}
+
+	//writingpoint NB_PTS_PER_BLOCK to mesh shader output
+	if (localID==LAST_THREAD)
+	{
+		v_out[NB_PTS_PER_BLOCK].fid = fiD;
+		v_out[NB_PTS_PER_BLOCK].packedTan = packSnorm4x8(vec4(axis[0],mapToSnorm(mask + NB_PTS_PER_BLOCK)));
+		gl_MeshVerticesNV[NB_PTS_PER_BLOCK].gl_Position = PROJ_MAT *vec4(translate0, 1.0);
+	}
+
+	//writing the first 32 points to mesh shader output
+	const uint doubleLocalID = localID<<1;
+	const mat2x3 m2 = getTanPoint(localID);
+	gl_PrimitiveIndicesNV[doubleLocalID] = localID;
+	gl_PrimitiveIndicesNV[doubleLocalID + 1] = localID + 1;
+
+	v_out[localID].fid = fiD;
+	v_out[localID].packedTan = packSnorm4x8(vec4(m2[0],mapToSnorm(mask + localID)));
+	gl_MeshVerticesNV[localID].gl_Position = PROJ_MAT *vec4(m2[1], 1.0);
+
+#else //USE_SINGLE_THREAD is defined
+
+	#if (AGGRESSIVE_OPTIM == 1)
+		if ((notEnd==1) && ((uint(IN.subIDs[gl_WorkGroupID.x])&0x80) != 0))//draw only one sgement for the compressed fiber
+		{
+			gl_PrimitiveCountNV = 1;
+			vec3 decompressedValues[2];
+			vec2 a = unpackUnorm2x16(listOfPoints[ID].data[0]);
+			vec2 b = unpackUnorm2x16(listOfPoints[ID].data[1]);
+			vec2 c = unpackUnorm2x16(listOfPoints[ID].data[2]);
+			decompressedValues[0] = vec3(a.x, a.y, b.x);
+			decompressedValues[1] = vec3(b.y, c.x, c.y);
+			mat4 m0 =getMatFromAxis(normalize(decompressedValues[1] - decompressedValues[0]));
+			m0[3].xyz = decompressedValues[0];
+			v_out[0].fid = fiD;
+			v_out[0].packedTan = packSnorm4x8(vec4(m0[0].xyz,mapToSnorm(mask + 0)));	
+			gl_MeshVerticesNV[0].gl_Position = projCamMultMV * m0[3];
+			gl_PrimitiveIndicesNV[0] = 0;
+			gl_PrimitiveIndicesNV[1] = 1;
+			a = unpackUnorm2x16(listOfPoints[ID+1].data[0]);
+			b = unpackUnorm2x16(listOfPoints[ID+1].data[1]);
+			c = unpackUnorm2x16(listOfPoints[ID+1].data[2]);
+			decompressedValues[0] = vec3(a.x, a.y, b.x);
+			decompressedValues[1] = vec3(b.y, c.x, c.y);
+			m0 =getMatFromAxis(normalize(decompressedValues[1] - decompressedValues[0]));
+			m0[3].xyz = decompressedValues[0];
+			v_out[1].fid = fiD;
+			v_out[1].packedTan = packSnorm4x8(vec4(m0[0].xyz,mapToSnorm(mask + 1)));	
+			gl_MeshVerticesNV[1].gl_Position = projCamMultMV * m0[3];
+			return;
+		}
+	#endif
+
+	vec3 decompressedValues[2];
+	vec2 a = unpackUnorm2x16(listOfPoints[ID].data[0]);
+	vec2 b = unpackUnorm2x16(listOfPoints[ID].data[1]);
+	vec2 c = unpackUnorm2x16(listOfPoints[ID].data[2]);
+	decompressedValues[0] = vec3(a.x, a.y, b.x);
+	decompressedValues[1] = vec3(b.y, c.x, c.y);
+	mat4 m0 =getMatFromAxis(normalize(decompressedValues[1] - decompressedValues[0]));
+	m0[3].xyz = decompressedValues[0];
+	v_out[0].fid = fiD;
+	v_out[0].packedTan = packSnorm4x8(vec4(m0[0].xyz,mapToSnorm(mask + 0)));	
+	gl_MeshVerticesNV[0].gl_Position = projCamMultMV * m0[3];
+	gl_PrimitiveIndicesNV[0] = 0;
+	gl_PrimitiveIndicesNV[1] = 1;
+	for(int i=1;i<nbPtPack;i++)
+	{
+		m0 = m0 * 	getMatFromAxis(getAxisFromSSBO(i));
+		v_out[i].fid = fiD;
+		v_out[i].packedTan = packSnorm4x8(vec4(m0[0].xyz,mapToSnorm(mask + i)));	
+		gl_MeshVerticesNV[i].gl_Position = projCamMultMV * m0[3];
+		gl_PrimitiveIndicesNV[2*i] = i;
+		gl_PrimitiveIndicesNV[2*i+1] = i+1;		
+	}
+
+	uint vidf = NB_PTS_PER_BLOCK;//vertexid final
+	a = unpackUnorm2x16(listOfPoints[ID+1].data[0]);
+	b = unpackUnorm2x16(listOfPoints[ID+1].data[1]);
+	c = unpackUnorm2x16(listOfPoints[ID+1].data[2]);
+	decompressedValues[0] = vec3(a.x, a.y, b.x);
+	decompressedValues[1] = vec3(b.y, c.x, c.y);
+	m0 =getMatFromAxis(normalize(decompressedValues[1] - decompressedValues[0]));
+	m0[3].xyz = decompressedValues[0];
+	v_out[vidf].fid = fiD;
+	v_out[vidf].packedTan = packSnorm4x8(vec4(m0[0].xyz,mapToSnorm(mask + vidf)));	
+	gl_MeshVerticesNV[vidf].gl_Position = projCamMultMV * m0[3];
+#endif
+
+}
